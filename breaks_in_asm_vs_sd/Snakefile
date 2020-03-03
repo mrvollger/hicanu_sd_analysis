@@ -1,0 +1,134 @@
+import sys
+import os
+
+bams = {
+	"chm13_hicanu_hifi_20k":"results/chm13_hicanu_hifi_20k.to.hg38.bam", 
+	"chm13_peregrine_hifi_20k":"results/chm13_peregrine_hifi_20k.to.hg38.bam", 
+	"chm13_canu_UL":"results/chm13_canu_UL.to.hg38.bam", 
+	"chm13_vollger_et_al_2019":"results/chm13_vollger_et_al_2019.to.hg38.bam",
+}
+SDSLOP="/net/eichler/vol26/projects/sda_assemblies/nobackups/assemblies/hg38/ucsc.merged.10k.slop.segdups.bed"
+SD="/net/eichler/vol26/projects/sda_assemblies/nobackups/assemblies/hg38/ucsc.segdups.bed"
+GENES="/net/eichler/vol26/projects/sda_assemblies/nobackups/assemblies/hg38/hg38.gene.locations.bed"
+FAI="/net/eichler/vol26/projects/sda_assemblies/nobackups/assemblies/hg38/ucsc.hg38.no_alts.fasta.fai"
+SMS=list(bams.keys())
+
+#ENDPOS=contig.end.pos.bed
+#./GetContigEnds.py $ASM > $ENDPOS
+#bedtools intersect -a $ENDPOS -b $SD
+
+rule all:
+	input:
+		txt = expand("results/{SM}.contig.large.ends.inter.sd.bed", SM=SMS),
+		ends = expand("results/{SM}.contig.large.ends.bed", SM=SMS),
+		summary = "results/sum.txt",
+
+
+def get_bam(wc):
+	return(bams[str(wc.SM) ])
+
+rule bam_to_paf:
+	input:
+		bam = get_bam,
+	output:
+		"results/{SM}.bam.paf",
+	shell:"""
+PATH=$PATH:$(readlink -f scripts/)
+
+samtools view -h {input.bam} | scripts/paftools.js sam2paf /dev/stdin > {output}
+"""
+
+
+rule ends:	
+	input:
+		paf = rules.bam_to_paf.output,
+	output:
+		"results/{SM}.contig.ends.bed",
+	shell:"""
+./scripts/GetContigEndsPAF.py {input.paf} > {output}
+"""
+
+
+rule inter:
+	input:
+		bed = rules.ends.output,
+		sd = SDSLOP, 
+	output:
+		"results/{SM}.contig.ends.inter.sd.bed",
+	shell:"""
+bedtools intersect -a {input.bed} -b {input.sd} > {output}
+"""
+	
+rule sd_inter:
+	input:
+		bed = rules.inter.output,
+		SD=SD,
+	output:
+		pdf="results/{SM}.contig.ends.inter.sd.pdf",
+		png="results/{SM}.contig.ends.inter.sd.png",
+		bed="results/{SM}.contig.ends.inter.sd.perid.bed",
+		gene="results/{SM}.contig.ends.inter.sd.gene.bed",
+	run:
+		import matplotlib
+		matplotlib.use('Agg')
+		import matplotlib.pyplot as plt
+		import seaborn as sns
+		import numpy as np
+		import pandas as pd
+
+		sd = pd.read_csv(input["SD"], sep = "\t")
+		shell("bedtools slop -b 10000 -g {FAI} -i {input.bed} | bedtools intersect -a - -b {input.SD} -wa -wb > {output.bed}")
+		shell("bedtools slop -b 10000 -g {FAI} -i {input.bed} | bedtools intersect -a - -b {GENES} -wa -wb | bedtools sort -i - | bedtools merge -c 4,6,11 -o distinct,distinct,distinct -i - > {output.gene}")
+		
+		bednames = ["r_name", "r_start", "r_end", "contig", "pos", "end", "dist"] 
+		colnames = bednames+ list(sd) 
+
+		df = pd.read_csv(output["bed"], sep="\t", names = colnames)
+		
+		out = []	
+		for cols, group in df.groupby(by=bednames):
+			idx = group["matchB"].idxmax()
+			out.append(group.loc[idx])
+		out = pd.DataFrame(out)
+	
+		mybins=np.logspace(3, np.log10(10**6),50)
+	
+		g = sns.JointGrid( sd["matchB"], sd["fracMatch"])
+		
+		g.ax_joint.scatter( sd["matchB"], sd["fracMatch"], color = "gray", s=1, alpha=0.25, label="SD")
+		g.ax_marg_y.hist(sd["fracMatch"], bins=50, orientation="horizontal", color="gray")
+		
+		g.ax_joint.scatter( out["matchB"], out["fracMatch"], color = "darkred", s=5, label="SD with contig end")
+		g.ax_marg_x.hist(sd["matchB"], bins=mybins, color="gray")
+		g.ax_joint.set(xscale="log")
+		
+		g.ax_joint.set_xlabel('Segmental duplication length (bp)', fontweight='bold')
+		g.ax_joint.set_ylabel('Segmental duplication sequence identity', fontweight='bold')
+		#g.ax_joint.legend()
+
+		g.savefig(output["pdf"])	
+		g.savefig(output["png"], dpi=600)	
+		
+		nrow = len(out["matchB"])
+		print( sum((out["matchB"]>=10000) & (out["fracMatch"] >= .98)), nrow)
+
+def ftol(f):
+	return( [l.strip() for l in open(f).readlines()] )
+
+rule sum:
+	input:
+		ends = expand("results/{SM}.contig.ends.bed", SM=SMS),
+		beds = expand("results/{SM}.contig.ends.inter.sd.bed", SM=SMS),
+		pdfs = expand("results/{SM}.contig.ends.inter.sd.pdf", SM=SMS),
+	output:
+		txt = "results/sum.txt",
+	run:
+		out = "sample\tends_in_sd\ttotal_ends\tfrac_ending_in_sd\n"
+		for bed, end, SM in zip(input["beds"], input["ends"], SMS ):
+			bed = ftol(bed)
+			end = ftol(end)
+			out += "{}\t{}\t{}\t{:.2f}\n".format(SM, len(bed), len(end), len(bed)/len(end)) 
+
+		print(out)
+		open(output["txt"], "w+").write(out)
+
